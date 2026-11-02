@@ -1,6 +1,7 @@
 import base64
 import copy
 import json
+from pathlib import Path
 
 import pytest
 from botocore.exceptions import ClientError
@@ -176,6 +177,13 @@ def test_unsupported_type_is_skipped_not_failed(env, capsys, ty):
     assert len(env.s3.requests) == 1
     assert len(env.bodies()) == 1
     assert '"event":"record_skipped"' in capsys.readouterr().out
+
+
+def test_smoke_event_writes_nothing(env):
+    # Jenkins가 배포 직후 실제 Lambda에 보내는 이벤트. 운영 S3/SQS에 아무것도 남기면 안 된다.
+    event = json.loads((Path(__file__).parent / "smoke-event.json").read_text(encoding="utf-8"))
+    assert env.invoke(event["Records"]) == failures()
+    assert env.calls == []
 
 
 # --- 전송 동작 -------------------------------------------------------------
