@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.ubi.processing.PreprocessHandlerTest" tests="19" skipped="0" failures="0" errors="0" timestamp="2026-11-01T16:41:44.528Z" hostname="gjh-MacBook-Air.local" time="1.378">
+  <properties/>
+  <testcase name="missingSqsSuccessIsFailure()" classname="com.ubi.processing.PreprocessHandlerTest" time="1.147"/>
+  <testcase name="rejectsArraysDuplicateKeysNonfiniteTrailingJsonAndInvalidUtf8()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.007"/>
+  <testcase name="existingArchiveAllowsRetryButConflictDoesNot()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.009"/>
+  <testcase name="preservesTripMicrotripAndGpsPayloads()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.007"/>
+  <testcase name="batchLimitCountsUtf8Bytes()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.068"/>
+  <testcase name="messageLimitIncludesMetadata()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.003"/>
+  <testcase name="missingSequenceFailsWholeInvocationBeforeWrites()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.002"/>
+  <testcase name="timeBudgetDefersWithoutWrites()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.002"/>
+  <testcase name="malformedDataDoesNotBlockNeighbors()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.002"/>
+  <testcase name="archiveKeyIsStableOnSqsRetry()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.003"/>
+  <testcase name="emptyBatchMakesNoAwsCalls()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.001"/>
+  <testcase name="batchesAtMostTenMessages()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.011"/>
+  <testcase name="sqsExceptionRetriesEntireUnconfirmedBatch()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.003"/>
+  <testcase name="partialSqsFailureRetriesOnlyUnconfirmedRecord()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.003"/>
+  <testcase name="archiveFailureDoesNotSendFailedRecord()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.003"/>
+  <testcase name="archivesExactUtf8BodyBeforeSending()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.006"/>
+  <testcase name="logsDoNotExposePayloadOrSdkExceptionMessages()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.003"/>
+  <testcase name="timeBudgetAfterArchiveDefersSqsSend()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.002"/>
+  <testcase name="identityIsStableAndDistinctAcrossRecords()" classname="com.ubi.processing.PreprocessHandlerTest" time="0.002"/>
+  <system-out><![CDATA[{"failed":1,"event":"forward_batch_failed"}
+{"received":1,"failed":1,"event":"processing_summary"}
+{"sequenceNumber":"1","error":"IllegalArgumentException","event":"record_rejected"}
+{"sequenceNumber":"2","error":"JsonParseException","event":"record_rejected"}
+{"sequenceNumber":"3","error":"JsonParseException","event":"record_rejected"}
+{"sequenceNumber":"4","error":"JsonParseException","event":"record_rejected"}
+{"sequenceNumber":"5","error":"MismatchedInputException","event":"record_rejected"}
+{"sequenceNumber":"6","error":"MalformedInputException","event":"record_rejected"}
+{"sequenceNumber":"7","error":"MalformedInputException","event":"record_rejected"}
+{"received":7,"failed":7,"event":"processing_summary"}
+{"received":1,"failed":0,"event":"processing_summary"}
+{"sequenceNumber":"2","error":"S3Exception","event":"record_archive_failed"}
+{"received":1,"failed":1,"event":"processing_summary"}
+{"received":3,"failed":0,"event":"processing_summary"}
+{"received":3,"failed":0,"event":"processing_summary"}
+{"sequenceNumber":"1","error":"IllegalArgumentException","event":"record_rejected"}
+{"received":1,"failed":1,"event":"processing_summary"}
+{"count":1,"reason":"time_budget","event":"forward_deferred"}
+{"count":1,"reason":"time_budget","event":"forward_deferred"}
+{"received":2,"failed":2,"event":"processing_summary"}
+{"sequenceNumber":"2","error":"IllegalArgumentException","event":"record_rejected"}
+{"sequenceNumber":"3","error":"JsonParseException","event":"record_rejected"}
+{"received":4,"failed":2,"event":"processing_summary"}
+{"failed":1,"error":"RuntimeException","event":"forward_batch_failed"}
+{"received":1,"failed":1,"event":"processing_summary"}
+{"received":1,"failed":0,"event":"processing_summary"}
+{"received":0,"failed":0,"event":"processing_summary"}
+{"received":23,"failed":0,"event":"processing_summary"}
+{"failed":2,"error":"RuntimeException","event":"forward_batch_failed"}
+{"received":2,"failed":2,"event":"processing_summary"}
+{"failed":1,"event":"forward_batch_failed"}
+{"received":3,"failed":1,"event":"processing_summary"}
+{"sequenceNumber":"1","error":"RuntimeException","event":"record_archive_failed"}
+{"received":2,"failed":1,"event":"processing_summary"}
+{"received":1,"failed":0,"event":"processing_summary"}
+{"count":1,"reason":"time_budget","event":"forward_deferred"}
+{"received":1,"failed":1,"event":"processing_summary"}
+]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
