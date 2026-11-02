@@ -1,0 +1,13 @@
+# gitleaks 설정. 기본 규칙을 그대로 쓰고, 비밀이 아닌 것으로 확인된 값만 예외로 둔다.
+# Jenkins Secret Scan 단계가 레포 루트의 이 파일을 자동으로 읽는다.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known non-secret values"
+regexes = [
+    # 테스트용 가짜 스트림 ARN과 eventID로 계산한 idempotencyKey 기대값 (SHA-256)
+    # lambda-python/tests/test_preprocess.py의 KEY_1. generic-api-key 규칙의 오탐.
+    '''e0b73fd498fce0b4eaceae376d06d3d3a189e9ffdd11fda4d26583df9f0a9462''',
+]
