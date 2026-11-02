@@ -1,0 +1,11 @@
+# Runtime packages for the Lambda image, pinned including transitive dependencies
+# so builds are reproducible and Jenkins SCA (trivy fs) can read the versions.
+# Keep this file ASCII-only: pip on Windows reads it with the system code page.
+# To update: in an empty venv run `pip install boto3==<new version>`, then replace this list with `pip freeze`.
+boto3==1.43.123
+botocore==1.43.123
+jmespath==1.1.0
+python-dateutil==2.9.0.post0
+s3transfer==0.19.3
+six==1.17.0
+urllib3==2.8.0

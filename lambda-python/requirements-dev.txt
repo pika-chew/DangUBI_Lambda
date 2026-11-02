@@ -1,0 +1,8 @@
+# Test-only packages (not in the Lambda image), pinned the same way as requirements.txt.
+-r requirements.txt
+pytest==8.4.2
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+Pygments==2.21.0
+colorama==0.4.6; sys_platform == "win32"
