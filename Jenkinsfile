@@ -51,7 +51,7 @@ pipeline {
         IAC_IMAGE_FILE     = 'terraform_aws/processing-image.auto.tfvars.json'
         IAC_CRED_ID        = 'github-infra-push'      // Jenkins Credentials ID
 
-        SLACK_CHANNEL      = '#dangubi-deploy'        // TODO: 알림 채널
+        SLACK_CHANNEL      = '#jenkins'        // TODO: 알림 채널
         PLATFORM           = 'linux/arm64'            // Lambda architectures와 같아야 함
         REPORT_DIR         = 'reports'
 
