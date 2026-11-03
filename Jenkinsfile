@@ -15,6 +15,12 @@
 //  - Jenkins 호스트: arm64 에뮬레이션(binfmt) 1회 설치  docker run --privileged --rm tonistiigi/binfmt --install arm64
 //  - Terraform: Lambda는 Image 타입·arm64여야 한다 (terraform_aws/modules/processing/lambda.tf).
 //    배포는 Jenkins가 직접 하고, IaC 레포의 IAC_IMAGE_FILE에는 배포된 digest를 기록만 해서 코드와 실제 상태를 맞춘다.
+//  - Slack: Manage Jenkins → System → Slack에 워크스페이스와 Bot 토큰(xoxb-)을 등록하고, 봇을 SLACK_CHANNEL에 초대한다.
+//
+// Slack 알림 (빌드가 끝났을 때 결과만 한 번 보낸다)
+//  - main : 모든 결과 — 성공(배포함/배포 대상 변경 없음), 롤백, IaC 동기화 실패, 실패, 중단
+//  - PR   : 실패, 정상화(fixed)
+//  - 그 밖의 브랜치: 없음
 
 pipeline {
     agent any
@@ -33,7 +39,7 @@ pipeline {
     environment {
         AWS_REGION         = 'ap-northeast-2'
         AWS_DEFAULT_REGION = 'ap-northeast-2'
-        AWS_CRED_ID        = 'aws-ecr-jenkins'          // TODO: Jenkins Credentials ID
+        AWS_CRED_ID        = 'aws-ecr-jenkins'          // Jenkins Credentials ID
         FUNCTION_NAME      = 'ubi-dev-preprocess'     // Terraform: "${project_name}-${environment}-preprocess"
         ECR_REPOSITORY     = 'ubi-dev-preprocess'
         APP_DIR            = 'lambda-python'
@@ -42,7 +48,9 @@ pipeline {
         IAC_REPO_URL       = 'https://github.com/pika-chew/DangUBI_Infra.git'
         IAC_BRANCH         = 'main'
         IAC_IMAGE_FILE     = 'terraform_aws/processing-image.auto.tfvars.json'
-        IAC_CRED_ID        = 'github-infra-push'      // TODO: Jenkins Credentials ID
+        IAC_CRED_ID        = 'github-infra-push'      // Jenkins Credentials ID
+
+        SLACK_CHANNEL      = '#dangubi-deploy'        // TODO: 알림 채널
         PLATFORM           = 'linux/arm64'            // Lambda architectures와 같아야 함
         REPORT_DIR         = 'reports'
 
@@ -59,6 +67,8 @@ pipeline {
             steps {
                 sh 'mkdir -p ${REPORT_DIR}'
                 script {
+                    env.COMMIT_SUBJECT = sh(script: 'git log -1 --format=%s', returnStdout: true).trim()
+                    env.COMMIT_AUTHOR = sh(script: 'git log -1 --format=%an', returnStdout: true).trim()
                     env.DEPLOY = (env.BRANCH_NAME == 'main' && (params.FORCE_DEPLOY || appChanged())).toString()
                     echo "배포 대상: ${env.DEPLOY == 'true' ? FUNCTION_NAME : '없음 (검증만 수행)'}"
                 }
@@ -166,6 +176,7 @@ pipeline {
                 stage('Deploy & Smoke Test') {
                     steps {
                         withAws {
+                            script { env.LAMBDA_UPDATED = 'true' }  // 이후 중단되면 검증되지 않은 이미지가 남을 수 있다
                             sh '''
                                 aws lambda update-function-code --function-name "$FUNCTION_NAME" --image-uri "$IMAGE_DIGEST_URI" > /dev/null
                                 aws lambda wait function-updated --function-name "$FUNCTION_NAME"
@@ -187,6 +198,7 @@ pipeline {
                                         aws lambda update-function-code --function-name "$FUNCTION_NAME" --image-uri "$PREVIOUS_IMAGE" > /dev/null
                                         aws lambda wait function-updated --function-name "$FUNCTION_NAME"
                                     '''
+                                    env.ROLLED_BACK = 'true'
                                     error("${FUNCTION_NAME} 스모크 테스트 실패 (롤백 완료)")
                                 }
                             }
@@ -198,7 +210,12 @@ pipeline {
                 stage('Sync IaC') {
                     steps {
                         catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            syncIacImage()
+                            try {
+                                syncIacImage()
+                            } catch (e) {
+                                env.IAC_SYNC_FAILED = 'true'
+                                throw e
+                            }
                         }
                     }
                 }
@@ -210,6 +227,56 @@ pipeline {
         always {
             archiveArtifacts artifacts: "${REPORT_DIR}/**", allowEmptyArchive: true
             sh 'if [ -n "$IMAGE" ]; then docker image rm "$IMAGE" || true; fi'
+        }
+        // ── main: 결과마다 한 번 ──
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    def result = env.DEPLOY == 'true'
+                        ? "배포 `${shortDigest(env.PREVIOUS_IMAGE)}` → `${shortDigest(env.IMAGE_DIGEST_URI)}`"
+                        : "배포 대상 변경 없음 (검사만 수행)"
+                    notifyMain('good', "✅ *main 성공* · ${result}")
+                }
+            }
+        }
+        unstable {
+            script {
+                if (env.BRANCH_NAME == 'main' && env.IAC_SYNC_FAILED == 'true') {
+                    notifyMain('warning', "🟡 *main 배포 성공, IaC 동기화 실패* · `${IAC_IMAGE_FILE}`의 `processing_image_uri`를 직접 맞춰 주세요:\n`${env.IMAGE_DIGEST_URI}`")
+                } else if (env.BRANCH_NAME == 'main') {
+                    notifyMain('warning', "🟡 *main 불안정* · ${buildLink('console', 'Console Output')}")
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.BRANCH_NAME == 'main' && env.ROLLED_BACK == 'true') {
+                    notifyMain('danger', "<!here> 🔴 *main 배포 실패* · 스모크 테스트 실패 → 이전 이미지 `${shortDigest(env.PREVIOUS_IMAGE)}`로 롤백 완료 · " +
+                        buildLink("artifact/${env.REPORT_DIR}/smoke-response.json", 'smoke-response.json'))
+                } else if (env.BRANCH_NAME == 'main') {
+                    notifyMain('danger', "🔴 *main 실패* · 운영 Lambda는 바뀌지 않음 · ${buildLink('console', 'Console Output')}")
+                } else if (env.CHANGE_ID) {
+                    slackSend(channel: env.SLACK_CHANNEL, color: 'danger', message: "🔴 ${prLine()} 검사 실패 · ${buildLink('console', 'Console Output')}")
+                }
+            }
+        }
+        aborted {
+            script {
+                if (env.BRANCH_NAME == 'main' && env.LAMBDA_UPDATED == 'true') {
+                    // Lambda 교체 후 스모크 테스트 전에 끊기면 검증되지 않은 이미지가 운영에 남는다
+                    notifyMain('#999999', "<!here> ⚪ *main 배포 중단* · Lambda가 검증되지 않은 이미지 `${shortDigest(env.IMAGE_DIGEST_URI)}`일 수 있습니다. 확인해 주세요")
+                } else if (env.BRANCH_NAME == 'main') {
+                    notifyMain('#999999', "⚪ *main 중단* · 운영 Lambda는 바뀌지 않음")
+                }
+            }
+        }
+        // ── PR: 실패하던 검사가 다시 통과 ──
+        fixed {
+            script {
+                if (env.CHANGE_ID) {
+                    slackSend(channel: env.SLACK_CHANNEL, color: 'good', message: "✅ ${prLine()} 검사 통과 (이전 실패 해결) · ${buildLink()}")
+                }
+            }
         }
         cleanup { cleanWs() }
     }
@@ -280,6 +347,36 @@ def syncIacImage() {
             '''
         }
     }
+}
+
+// main 결과 알림. 어떤 커밋의 어느 빌드인지를 함께 붙인다.
+def notifyMain(String color, String message) {
+    slackSend(channel: env.SLACK_CHANNEL, color: color,
+              message: "*${FUNCTION_NAME}* ${message}\n${commitLine()} · ${buildLink()}")
+}
+
+// Slack 링크. path가 없으면 빌드 페이지, 있으면 빌드 아래의 하위 경로(console, artifact/...)
+def buildLink(String path = '', String label = null) {
+    "<${env.BUILD_URL}${path}|${label ?: "#${env.BUILD_NUMBER}"}>"
+}
+
+def commitLine() {
+    "`${env.GIT_COMMIT.take(7)}` ${slackEscape(env.COMMIT_SUBJECT)} (${slackEscape(env.COMMIT_AUTHOR)})"
+}
+
+def prLine() {
+    "<${env.CHANGE_URL}|PR #${env.CHANGE_ID}> ${slackEscape(env.CHANGE_TITLE)} (${slackEscape(env.CHANGE_AUTHOR)})"
+}
+
+// repository@sha256:<64자> → sha256:<앞 12자>
+def shortDigest(String uri) {
+    def digest = uri?.contains('@') ? uri.substring(uri.indexOf('@') + 1) : (uri ?: '-')
+    digest.length() > 19 ? digest.take(19) : digest
+}
+
+// Slack mrkdwn에서 특수 의미가 있는 문자를 바꾼다
+def slackEscape(String text) {
+    (text ?: '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 }
 
 def lambdaQuery(String query) {
