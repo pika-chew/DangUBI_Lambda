@@ -210,11 +210,14 @@ pipeline {
                 stage('Sync IaC') {
                     steps {
                         catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            try {
-                                syncIacImage()
-                            } catch (e) {
-                                env.IAC_SYNC_FAILED = 'true'
-                                throw e
+                            // try/catch는 Groovy 코드라 Declarative steps 안에서는 script 블록이 필요하다
+                            script {
+                                try {
+                                    syncIacImage()
+                                } catch (e) {
+                                    env.IAC_SYNC_FAILED = 'true'
+                                    throw e
+                                }
                             }
                         }
                     }
