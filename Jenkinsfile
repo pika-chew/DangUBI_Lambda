@@ -2,7 +2,8 @@
 //  - PR·브랜치 빌드 : 시크릿 검사 → 단위 테스트 → 의존성 취약점 검사
 //  - main 빌드      : 위 단계 + 사전 점검 → arm64 이미지 빌드·스캔 → ECR push → Lambda 교체 → 스모크 테스트(실패 시 롤백)
 //                     → IaC 레포의 이미지 digest 동기화
-//  - main에서 lambda-python/ 또는 Jenkinsfile이 바뀌었을 때만 배포한다. FORCE_DEPLOY로 강제 배포 가능.
+//  - lambda-python/이 바뀌지 않았으면(Jenkinsfile·문서만 변경) Test·SCA·배포를 건너뛰고 Secret Scan만 한다.
+//    비교 기준: PR은 대상 브랜치, 그 밖은 마지막 성공 빌드. FORCE_DEPLOY를 켜면 변경과 상관없이 전부 실행한다.
 //
 // Jenkins에는 docker CLI만 있으므로, 도구는 단계마다 공식 컨테이너 이미지로 실행한다.
 // (docker.image().inside는 Jenkins 컨테이너의 볼륨을 그대로 공유하므로 워크스페이스 경로가 같다)
@@ -26,7 +27,7 @@ pipeline {
     agent any
 
     parameters {
-        booleanParam(name: 'FORCE_DEPLOY', defaultValue: false, description: 'main에서 변경이 없어도 이미지를 새로 빌드해 배포')
+        booleanParam(name: 'FORCE_DEPLOY', defaultValue: false, description: 'lambda-python/ 변경이 없어도 테스트를 돌리고, main이면 이미지를 새로 빌드해 배포')
     }
 
     options {
@@ -69,8 +70,10 @@ pipeline {
                 script {
                     env.COMMIT_SUBJECT = sh(script: 'git log -1 --format=%s', returnStdout: true).trim()
                     env.COMMIT_AUTHOR = sh(script: 'git log -1 --format=%an', returnStdout: true).trim()
-                    env.DEPLOY = (env.BRANCH_NAME == 'main' && (params.FORCE_DEPLOY || appChanged())).toString()
-                    echo "배포 대상: ${env.DEPLOY == 'true' ? FUNCTION_NAME : '없음 (검증만 수행)'}"
+                    env.CODE_CHANGED = (params.FORCE_DEPLOY || codeChanged()).toString()
+                    env.DEPLOY = (env.BRANCH_NAME == 'main' && env.CODE_CHANGED == 'true').toString()
+                    echo "${APP_DIR} 변경: ${env.CODE_CHANGED == 'true' ? '있음 → 테스트 실행' : '없음 → Test·SCA·배포 생략'}"
+                    echo "배포 대상: ${env.DEPLOY == 'true' ? FUNCTION_NAME : '없음'}"
                 }
             }
         }
@@ -84,6 +87,7 @@ pipeline {
         }
 
         stage('Test') {
+            when { environment name: 'CODE_CHANGED', value: 'true' }
             steps {
                 inContainer(env.PYTHON_IMAGE) {
                     dir(env.APP_DIR) {
@@ -98,6 +102,7 @@ pipeline {
         }
 
         stage('SCA') {
+            when { environment name: 'CODE_CHANGED', value: 'true' }
             steps {
                 inContainer(env.TRIVY_IMAGE) {
                     sh 'trivy fs --cache-dir .trivy-cache --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --skip-dirs "**/.venv" ${APP_DIR}'
@@ -237,7 +242,7 @@ pipeline {
                 if (env.BRANCH_NAME == 'main') {
                     def result = env.DEPLOY == 'true'
                         ? "배포 `${shortDigest(env.PREVIOUS_IMAGE)}` → `${shortDigest(env.IMAGE_DIGEST_URI)}`"
-                        : "배포 대상 변경 없음 (검사만 수행)"
+                        : "${APP_DIR} 변경 없음 (테스트·배포 생략)"
                     notifyMain('good', "✅ *main 성공* · ${result}")
                 }
             }
@@ -287,12 +292,23 @@ pipeline {
 
 // ───────────────────────── helpers ─────────────────────────
 
-// main에서 마지막 성공 빌드 이후 lambda-python/ 또는 Jenkinsfile이 바뀌었는지. 비교 기준이 없으면 바뀐 것으로 본다.
-def appChanged() {
-    def base = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT
-    if (!base) return true
-    def rc = sh(script: "git diff --quiet ${base} HEAD -- ${env.APP_DIR} Jenkinsfile", returnStatus: true)
-    // 0: 변경 없음, 1: 변경 있음, 그 밖(기준 커밋이 사라진 경우 등): 안전하게 배포
+// lambda-python/이 바뀌었는지. Jenkinsfile·문서 변경은 이미지 내용과 무관하므로 보지 않는다.
+//  - PR: 대상 브랜치와의 공통 조상 이후 PR이 바꾼 내용 (origin/<대상>...HEAD)
+//  - 그 밖: 마지막 성공 빌드 이후
+// 비교 기준이 없으면(첫 빌드, 대상 브랜치 ref 없음) 바뀐 것으로 본다.
+def codeChanged() {
+    def range = null
+    if (env.CHANGE_TARGET) {
+        def target = "origin/${env.CHANGE_TARGET}"
+        if (sh(script: "git rev-parse --verify --quiet ${target} > /dev/null", returnStatus: true) == 0) {
+            range = "${target}...HEAD"
+        }
+    } else if (env.GIT_PREVIOUS_SUCCESSFUL_COMMIT) {
+        range = "${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT} HEAD"
+    }
+    if (!range) return true
+    def rc = sh(script: "git diff --quiet ${range} -- ${env.APP_DIR}", returnStatus: true)
+    // 0: 변경 없음, 1: 변경 있음, 그 밖(기준 커밋이 사라진 경우 등): 안전하게 실행
     return rc != 0
 }
 
