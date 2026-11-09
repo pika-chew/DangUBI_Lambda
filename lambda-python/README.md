@@ -1,15 +1,17 @@
 # Python 컨테이너 Lambda
 
-Kinesis로 들어온 차량 단말 메시지에서 점수 계산에 필요한 필드만 남겨 S3에 보관하고 SQS로 전달하는 Python 3.13 Lambda입니다.
-S3 저장, SQS 전송, 재시도 규칙은 `lambda-java`와 같고, 필드 선별은 이 버전에만 있습니다.
+IoT Core로 들어온 차량 단말 메시지에서 점수 계산에 필요한 필드만 남겨 Firehose로 전달하는 Python 3.13 Lambda입니다.
+
+전체 흐름은 `IoT Core → Lambda → Firehose → S3 → SQS`입니다. S3 저장과 SQS 알림은 Firehose와 S3 이벤트 알림이 맡습니다.
 
 ## 실행 계약
 
 - 핸들러: `preprocess.handler` (`src/preprocess.py`).
-- 입력: AWS Kinesis 이벤트의 `Records` 배열. 각 `kinesis.data`는 Base64 JSON 객체입니다.
-- 환경 변수: `QUEUE_URL`, `PROCESSED_BUCKET`, `MAX_MESSAGE_BYTES`.
-- 출력: `{"batchItemFailures":[{"itemIdentifier":"실패 sequenceNumber"}]}`.
-- 한 레코드당 SQS 메시지 1개, API 요청당 최대 10개. 본문과 API 배치는 256KiB 이하입니다.
+- 입력: IoT Rule이 호출할 때 넘기는 메시지 JSON 객체 하나 (`SELECT *, topic(4) AS vehicleId ...`의 결과).
+- 환경 변수: `FIREHOSE_STREAM_NAME` (Firehose 스트림 이름).
+- 권한: 대상 스트림의 `firehose:PutRecord`.
+- 출력: `{"status":"forwarded"}` 또는 `{"status":"skipped"}`. 실패하면 예외를 던집니다.
+- 메시지 하나당 Firehose 레코드 1개. 레코드는 줄바꿈으로 끝나므로 S3 객체는 한 줄에 JSON 하나인 형식(NDJSON)입니다.
 
 ## 메시지 변환
 
@@ -17,7 +19,7 @@ S3 저장, SQS 전송, 재시도 규칙은 `lambda-java`와 같고, 필드 선�
 
 ```json
 {"vehicleId": "vehicle-001", "ts": 1793575800100, "ty": 4, "schemaVersion": 1,
- "idempotencyKey": "SHA-256(stream ARN + ':' + eventID)", "pld": {"tid": 354, "clt": 1793575800000, "sp": 70, "em": "28"}}
+ "idempotencyKey": "SHA-256(vehicleId, ts, ty, 선별된 pld의 JSON)", "pld": {"tid": 354, "clt": 1793575800000, "sp": 70, "em": "28"}}
 ```
 
 | `ty` | 종류 | 남기는 `pld` 필드 |
@@ -26,22 +28,18 @@ S3 저장, SQS 전송, 재시도 규칙은 `lambda-java`와 같고, 필드 선�
 | 4 | Microtrip (주행 중 주기적) | `tid`, `clt`, `sp`, `em` |
 
 - 남길 필드 목록은 `PLD_FIELDS` 한 곳에서 관리합니다. 필드를 되살리려면(예: 공회전 점수용 `idt`) 여기에 추가합니다.
-- `vehicleId`, `ts`, `ty`, `pld` 또는 남길 필드가 없거나 `null`이면 거부(실패 → 재시도)합니다.
-- `ty`가 3·4가 아니면 `record_skipped` 로그만 남기고 성공으로 처리합니다. S3와 SQS에는 쓰지 않습니다.
-- 값의 단위·범위는 검사하지 않습니다.
+- `vehicleId`, `ts`, `ty`, `pld` 또는 남길 필드가 없거나 `null`이면 거부합니다.
+- `ty`가 3·4가 아니면 `record_skipped` 로그만 남기고 성공으로 처리합니다. Firehose에는 쓰지 않습니다.
+- 값의 단위·범위는 검사하지 않습니다. `NaN`/`Infinity`는 거부합니다.
 
-처리 순서는 `JSON 검사 → 필드 선별 → S3 저장 → SQS 전송`입니다.
+처리 순서는 `검증 → 필드 선별 → Firehose 전송`입니다.
 
-- JSON 검사: 엄격한 UTF-8, 최상위 객체만 허용하고 중복 키, `NaN`/`Infinity`·범위 초과 실수, 뒤에 붙은 토큰은 거부합니다.
-- S3: `processed/{key 앞 2자}/{idempotencyKey}/{본문 SHA-256}.json`에 `If-None-Match: *`로 저장합니다. 이미 있으면(412) 성공으로 봅니다. 실패한 레코드는 SQS로 보내지 않습니다.
-- SQS: 응답의 `Successful`에 있는 항목만 성공입니다. 예외가 나면 해당 배치 전체를 재시도 대상으로 돌려줍니다.
-- 남은 실행 시간이 12초 미만이면 새 쓰기를 하지 않고 해당 레코드를 실패로 돌려 재전달받습니다.
-- 로그는 JSON 한 줄이며, payload나 SDK 예외 메시지 없이 예외 클래스 이름만 남깁니다.
+- 실패: 거부나 전송 실패는 호출을 실패시킵니다. IoT Rule의 비동기 호출이므로 Lambda가 재시도하고, 그래도 실패한 이벤트는 Lambda에 설정한 실패 목적지로 갑니다.
+- 중복: Firehose와 비동기 호출은 최소 1회 전달이라 같은 레코드가 두 번 저장될 수 있습니다. 받는 쪽은 `idempotencyKey`로 걸러야 합니다.
+- 로그는 JSON 한 줄이며, payload나 SDK 예외 메시지 없이 예외 클래스 이름만 남깁니다. `processing_summary`의 `failed`는 CloudWatch 지표 `ProcessingFailedRecords`가 읽습니다.
+- boto3 호출은 연결 2초, 읽기 3초, 최대 2회 시도로 제한합니다.
 
-## Java 버전과의 차이
-
-- 출력 형식이 다릅니다. Java는 원본 전체를 `payload`에 넣고 Kinesis 메타데이터(`source`)를 붙이며, Python은 필드를 선별해 평탄화하고 `source`를 넣지 않습니다. `idempotencyKey` 계산 방식은 같습니다.
-- boto3에는 Java SDK의 전체 호출 시간 제한(`apiCallTimeout`)이 없습니다. 대신 연결 2초, 읽기 3초, 최대 2회 시도로 제한합니다.
+`lambda-java`는 이전 흐름(Kinesis → S3·SQS 직접 쓰기) 그대로이며 배포 대상이 아닙니다.
 
 ## 로컬 검증
 
@@ -51,7 +49,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -q
 ```
 
-테스트는 S3/SQS를 가짜 객체로 대체하며 실제 AWS를 호출하지 않습니다.
+테스트는 Firehose를 가짜 객체로 대체하며 실제 AWS를 호출하지 않습니다.
 
 ## 이미지 빌드
 

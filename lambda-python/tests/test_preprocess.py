@@ -1,12 +1,11 @@
-import base64
 import copy
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
-from botocore.exceptions import ClientError
 
-from preprocess import PLD_FIELDS, PreprocessHandler, message_body
+from preprocess import PLD_FIELDS, PreprocessHandler, RecordFailed, message_body
 
 # 단말이 보내는 원본. 제외 필드까지 모두 들어 있다.
 TRIP = {"vehicleId": "vehicle-001", "ts": 1793577600100, "ty": 3, "pld": {
@@ -17,72 +16,37 @@ TRIP = {"vehicleId": "vehicle-001", "ts": 1793577600100, "ty": 3, "pld": {
 MICROTRIP = {"vehicleId": "vehicle-001", "ts": 1793575800100, "ty": 4, "pld": {
     "tid": 354, "fc": 12, "lat": 37.509141, "lon": 127.063228, "lc": 80, "clt": 1793575800000, "cdit": 15000,
     "rpm": 2200, "sp": 70, "em": "28", "el": 40, "xyz": {"ax": 0.1, "ay": 0.2, "az": 9.8}, "vv": 12.4, "tpos": 20}}
-# record(1)의 idempotencyKey. Java 버전과 같은 값이다.
-KEY_1 = "e0b73fd498fce0b4eaceae376d06d3d3a189e9ffdd11fda4d26583df9f0a9462"
+# MICROTRIP의 idempotencyKey. 계산 입력이 바뀌면 받는 쪽의 중복 제거가 깨지므로 형식을 고정해 검사한다.
+MICROTRIP_KEY = hashlib.sha256(
+    b'{"vehicleId":"vehicle-001","ts":1793575800100,"ty":4,'
+    b'"pld":{"tid":354,"clt":1793575800000,"sp":70,"em":"28"}}').hexdigest()
 
 
-class FakeS3:
-    def __init__(self, calls):
-        self.calls = calls
+class FakeFirehose:
+    def __init__(self):
         self.requests = []
         self.effects = []
 
-    def put_object(self, **kwargs):
-        self.calls.append("s3")
+    def put_record(self, **kwargs):
         self.requests.append(kwargs)
         if self.effects:
-            effect = self.effects.pop(0)
-            if effect is not None:
-                raise effect
-        return {}
-
-
-class FakeSqs:
-    def __init__(self, calls):
-        self.calls = calls
-        self.requests = []
-        self.effects = []
-
-    def send_message_batch(self, **kwargs):
-        self.calls.append("sqs")
-        self.requests.append(kwargs)
-        if self.effects:
-            effect = self.effects.pop(0)
-            if isinstance(effect, Exception):
-                raise effect
-            return effect
-        return {"Successful": [{"Id": entry["Id"]} for entry in kwargs["Entries"]]}
-
-
-class FakeContext:
-    def __init__(self, *remaining):
-        self.remaining = list(remaining)
-
-    def get_remaining_time_in_millis(self):
-        return self.remaining.pop(0) if len(self.remaining) > 1 else self.remaining[0]
-
-
-def client_error(status, code):
-    return ClientError({"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}}, "PutObject")
+            raise self.effects.pop(0)
+        return {"RecordId": "test"}
 
 
 @pytest.fixture
 def env():
-    calls = []
-    environment = {"QUEUE_URL": "https://example.test/queue",
-                   "PROCESSED_BUCKET": "test-processed", "MAX_MESSAGE_BYTES": "262144"}
-    s3 = FakeS3(calls)
-    sqs = FakeSqs(calls)
-    handler = PreprocessHandler(s3, sqs, environment)
+    environment = {"FIREHOSE_STREAM_NAME": "test-delivery"}
+    firehose = FakeFirehose()
+    handler = PreprocessHandler(firehose, environment)
 
     class Env:
         pass
 
     result = Env()
-    result.calls, result.environment, result.s3, result.sqs = calls, environment, s3, sqs
-    result.context = FakeContext(30000)
-    result.invoke = lambda records: handler.handle_request({"Records": records}, result.context)
-    result.bodies = lambda: [entry["MessageBody"] for request in sqs.requests for entry in request["Entries"]]
+    result.environment, result.firehose = environment, firehose
+    result.invoke = handler.handle_request
+    result.records = lambda: [request["Record"]["Data"] for request in firehose.requests]
     return result
 
 
@@ -94,218 +58,181 @@ def message(base=MICROTRIP, **changes):
             result.pop(key, None)
         else:
             result[key] = value
-    return json.dumps(result, ensure_ascii=False)
+    return result
 
 
-def record(sequence, body=None):
-    body = message() if body is None else body
-    data = body.encode("utf-8") if isinstance(body, str) else body
-    return {"eventSourceARN": "arn:aws:kinesis:ap-northeast-2:000000000000:stream/test",
-            "eventID": f"shardId-000000000000:{sequence}",
-            "kinesis": {"sequenceNumber": str(sequence), "partitionKey": "vehicle-001",
-                        "approximateArrivalTimestamp": 1793240000,
-                        "data": base64.b64encode(data).decode("ascii")}}
-
-
-def failures(*sequences):
-    return {"batchItemFailures": [{"itemIdentifier": sequence} for sequence in sequences]}
+def without_key(body):
+    result = json.loads(body)
+    assert len(result.pop("idempotencyKey")) == 64
+    return result
 
 
 # --- 필드 선별 -------------------------------------------------------------
 
 def test_trip_keeps_only_listed_fields():
-    assert json.loads(message_body(record(1, message(TRIP)))) == {
-        "vehicleId": "vehicle-001", "ts": 1793577600100, "ty": 3, "schemaVersion": 1, "idempotencyKey": KEY_1,
+    assert without_key(message_body(message(TRIP))) == {
+        "vehicleId": "vehicle-001", "ts": 1793577600100, "ty": 3, "schemaVersion": 1,
         "pld": {"tid": 354, "stt": 1793574000000, "edt": 1793577600000, "dis": 30000,
                 "hsts": 90, "mesp": 30, "dtvt": 3600}}
 
 
 def test_microtrip_keeps_only_listed_fields():
-    assert json.loads(message_body(record(1, message(MICROTRIP)))) == {
-        "vehicleId": "vehicle-001", "ts": 1793575800100, "ty": 4, "schemaVersion": 1, "idempotencyKey": KEY_1,
+    assert without_key(message_body(message())) == {
+        "vehicleId": "vehicle-001", "ts": 1793575800100, "ty": 4, "schemaVersion": 1,
         "pld": {"tid": 354, "clt": 1793575800000, "sp": 70, "em": "28"}}
 
 
 def test_body_bytes_are_compact_and_ordered():
-    assert message_body(record(1)) == (
+    assert message_body(message()) == (
         '{"vehicleId":"vehicle-001","ts":1793575800100,"ty":4,"schemaVersion":1,'
-        f'"idempotencyKey":"{KEY_1}","pld":{{"tid":354,"clt":1793575800000,"sp":70,"em":"28"}}}}')
+        f'"idempotencyKey":"{MICROTRIP_KEY}","pld":{{"tid":354,"clt":1793575800000,"sp":70,"em":"28"}}}}')
 
 
 def test_unknown_fields_are_dropped():
-    raw = copy.deepcopy(MICROTRIP)
+    raw = message()
     raw["firmwareNew"] = "x"
     raw["pld"]["newSensor"] = 1
-    body = json.loads(message_body(record(1, json.dumps(raw))))
+    body = json.loads(message_body(raw))
     assert "firmwareNew" not in body
     assert "newSensor" not in body["pld"]
 
 
 def test_phone_number_never_leaves_lambda(env):
-    assert env.invoke([record(1, message(TRIP))]) == failures()
-    assert "01012345678" not in env.bodies()[0]
-    assert b"01012345678" not in env.s3.requests[0]["Body"]
+    assert env.invoke(message(TRIP)) == {"status": "forwarded"}
+    assert b"01012345678" not in env.records()[0]
 
 
 @pytest.mark.parametrize("base", [TRIP, MICROTRIP], ids=["trip", "microtrip"])
 def test_missing_kept_pld_field_is_rejected(env, base):
-    records = []
-    for index, field in enumerate(PLD_FIELDS[base["ty"]]):
-        raw = copy.deepcopy(base)
+    for field in PLD_FIELDS[base["ty"]]:
+        raw = message(base)
         del raw["pld"][field]
-        records.append(record(index + 1, json.dumps(raw)))
-    assert env.invoke(records) == failures(*[str(index + 1) for index in range(len(records))])
-    assert env.calls == []
+        with pytest.raises(RecordFailed):
+            env.invoke(raw)
+    assert env.firehose.requests == []
 
 
 def test_null_kept_field_is_rejected(env):
-    raw = copy.deepcopy(MICROTRIP)
+    raw = message()
     raw["pld"]["em"] = None
-    assert env.invoke([record(1, json.dumps(raw))]) == failures("1")
+    with pytest.raises(RecordFailed):
+        env.invoke(raw)
+    assert env.firehose.requests == []
 
 
 @pytest.mark.parametrize("changes", [{"vehicleId": None}, {"vehicleId": ""}, {"vehicleId": 1}, {"ts": None},
                                      {"ty": None}, {"pld": None}, {"pld": [1]}])
 def test_invalid_envelope_is_rejected(env, changes):
-    assert env.invoke([record(1, message(**changes))]) == failures("1")
-    assert env.calls == []
+    with pytest.raises(RecordFailed):
+        env.invoke(message(**changes))
+    assert env.firehose.requests == []
+
+
+@pytest.mark.parametrize("event", [[], "text", None, {"Records": []}], ids=["list", "string", "null", "kinesis"])
+def test_event_that_is_not_a_message_is_rejected(env, event):
+    with pytest.raises(RecordFailed):
+        env.invoke(event)
+    assert env.firehose.requests == []
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+def test_non_finite_number_is_rejected(env, value):
+    raw = message()
+    raw["pld"]["sp"] = value
+    with pytest.raises(RecordFailed):
+        env.invoke(raw)
+    assert env.firehose.requests == []
 
 
 @pytest.mark.parametrize("ty", [2, 5, "4", 4.0, True])
 def test_unsupported_type_is_skipped_not_failed(env, capsys, ty):
-    assert env.invoke([record(1, message(ty=ty)), record(2)]) == failures()
-    assert len(env.s3.requests) == 1
-    assert len(env.bodies()) == 1
+    assert env.invoke(message(ty=ty)) == {"status": "skipped"}
+    assert env.firehose.requests == []
     assert '"event":"record_skipped"' in capsys.readouterr().out
 
 
-def test_smoke_event_writes_nothing(env):
-    # Jenkins가 배포 직후 실제 Lambda에 보내는 이벤트. 운영 S3/SQS에 아무것도 남기면 안 된다.
+def test_smoke_event_is_forwarded(env):
+    # Jenkins가 CI Lambda에 보내는 이벤트. Jenkinsfile이 이 응답을 검사하므로 CI Firehose까지 전달돼야 한다.
     event = json.loads((Path(__file__).parent / "smoke-event.json").read_text(encoding="utf-8"))
-    assert env.invoke(event["Records"]) == failures()
-    assert env.calls == []
+    assert env.invoke(event) == {"status": "forwarded"}
+    assert len(env.records()) == 1
 
 
 # --- 전송 동작 -------------------------------------------------------------
 
-def test_archives_exact_utf8_body_before_sending(env):
-    assert env.invoke([record(1, message(vehicleId="차량-001"))]) == failures()
-    request = env.s3.requests[0]
-    assert request["Bucket"] == "test-processed"
-    assert request["IfNoneMatch"] == "*"
-    assert request["Body"] == env.bodies()[0].encode("utf-8")
-    assert env.calls == ["s3", "sqs"]
+def test_sends_one_newline_terminated_utf8_record(env):
+    assert env.invoke(message(vehicleId="차량-001")) == {"status": "forwarded"}
+    assert len(env.firehose.requests) == 1
+    assert env.firehose.requests[0]["DeliveryStreamName"] == "test-delivery"
+    data = env.records()[0]
+    assert data.endswith(b"\n") and data.count(b"\n") == 1
+    assert "차량-001".encode("utf-8") in data
 
 
-def test_batches_at_most_ten_messages(env):
-    assert env.invoke([record(sequence) for sequence in range(1, 24)]) == failures()
-    assert [len(request["Entries"]) for request in env.sqs.requests] == [10, 10, 3]
+def test_firehose_failure_fails_invocation_for_retry(env):
+    env.firehose.effects = [RuntimeError("network")]
+    with pytest.raises(RecordFailed):
+        env.invoke(message())
 
 
-def test_batch_limit_counts_utf8_bytes(env):
-    body = message(vehicleId="가" * 50000)
-    assert env.invoke([record(1, body), record(2, body), record(3, body)]) == failures()
-    assert len(env.sqs.requests) == 3
-    assert all(sum(len(entry["MessageBody"].encode("utf-8")) for entry in request["Entries"]) <= 262144
-               for request in env.sqs.requests)
+def test_retry_produces_same_record(env):
+    env.firehose.effects = [RuntimeError("network")]
+    with pytest.raises(RecordFailed):
+        env.invoke(message())
+    assert env.invoke(message()) == {"status": "forwarded"}
+    assert env.records()[0] == env.records()[1]
 
 
-def test_partial_sqs_failure_retries_only_unconfirmed_record(env):
-    env.sqs.effects = [{"Successful": [{"Id": "0"}, {"Id": "2"}]}]
-    assert env.invoke([record(1), record(2), record(3)]) == failures("2")
+def test_identity_is_distinct_across_messages():
+    keys = {json.loads(message_body(item))["idempotencyKey"]
+            for item in [message(), message(ts=1793575800101), message(vehicleId="vehicle-002"), message(TRIP)]}
+    assert len(keys) == 4
 
 
-def test_sqs_exception_retries_entire_unconfirmed_batch(env):
-    env.sqs.effects = [RuntimeError("network")]
-    assert env.invoke([record(1), record(2)]) == failures("1", "2")
+def test_identity_ignores_dropped_fields():
+    raw = message()
+    raw["pld"]["rpm"] = 9999
+    assert json.loads(message_body(raw))["idempotencyKey"] == MICROTRIP_KEY
 
 
-def test_malformed_data_does_not_block_neighbors(env):
-    bad_base64 = record(2)
-    bad_base64["kinesis"]["data"] = "%%%"
-    assert env.invoke([record(1), bad_base64, record(3, "{broken"), record(4)]) == failures("2", "3")
-    assert len(env.bodies()) == 2
+@pytest.mark.parametrize("value", [None, "", "  "], ids=["missing", "empty", "blank"])
+def test_missing_setting_fails_before_writes(env, value):
+    env.environment.pop("FIREHOSE_STREAM_NAME")
+    if value is not None:
+        env.environment["FIREHOSE_STREAM_NAME"] = value
+    with pytest.raises(RuntimeError):
+        env.invoke(message())
+    assert env.firehose.requests == []
 
 
-def test_rejects_arrays_duplicate_keys_nonfinite_trailing_json_and_invalid_utf8(env):
-    valid = message()
-    invalid = ["[]", valid[:-1] + ', "vehicleId": "other"}', valid.replace('"sp": 70', '"sp": NaN'),
-               valid.replace('"sp": 70', '"sp": Infinity'), valid + " {}", valid.replace('"sp": 70', '"sp": 1e400')]
-    records = [record(index + 1, body) for index, body in enumerate(invalid)]
-    records.append(record(7, b"\xff"))
-    records.append(record(8, valid.encode("utf-16")))
-    assert env.invoke(records) == failures("1", "2", "3", "4", "5", "6", "7", "8")
-    assert env.calls == []
+# --- 로그 -------------------------------------------------------------------
+
+def summary(output):
+    lines = [json.loads(line) for line in output.splitlines()]
+    return next(line for line in lines if line["event"] == "processing_summary")
 
 
-def test_message_limit_applies_to_processed_body(env):
-    item = record(1)
-    env.environment["MAX_MESSAGE_BYTES"] = str(len(message_body(item).encode("utf-8")) - 1)
-    assert env.invoke([item]) == failures("1")
-    assert env.calls == []
+def test_summary_reports_each_outcome_for_failure_metric(env, capsys):
+    env.invoke(message())
+    assert summary(capsys.readouterr().out) == {"received": 1, "skipped": 0, "failed": 0,
+                                                "event": "processing_summary"}
+    env.invoke(message(ty=2))
+    assert summary(capsys.readouterr().out)["skipped"] == 1
+    env.firehose.effects = [RuntimeError("network")]
+    with pytest.raises(RecordFailed):
+        env.invoke(message())
+    assert summary(capsys.readouterr().out)["failed"] == 1
+    with pytest.raises(RecordFailed):
+        env.invoke(message(vehicleId=None))
+    assert summary(capsys.readouterr().out)["failed"] == 1
 
 
-def test_time_budget_defers_without_writes(env):
-    env.context.remaining = [1000]
-    assert env.invoke([record(1), record(2)]) == failures("1", "2")
-    assert env.calls == []
-
-
-def test_time_budget_after_archive_defers_sqs_send(env):
-    env.context.remaining = [30000, 1000]
-    assert env.invoke([record(1)]) == failures("1")
-    assert env.calls == ["s3"]
-
-
-def test_identity_is_stable_and_distinct_across_records():
-    first = message_body(record(1))
-    assert first == message_body(record(1))
-    key = json.loads(first)["idempotencyKey"]
-    assert key != json.loads(message_body(record(2)))["idempotencyKey"]
-    assert key == KEY_1
-
-
-def test_missing_sqs_success_is_failure(env):
-    env.sqs.effects = [{}]
-    assert env.invoke([record(1)]) == failures("1")
-
-
-def test_missing_sequence_fails_whole_invocation_before_writes(env):
-    item = record(2)
-    del item["kinesis"]["sequenceNumber"]
-    with pytest.raises(ValueError):
-        env.invoke([record(1), item])
-    assert env.calls == []
-
-
-def test_empty_batch_makes_no_aws_calls(env):
-    assert env.invoke([]) == failures()
-    assert env.calls == []
-
-
-def test_archive_failure_does_not_send_failed_record(env):
-    env.s3.effects = [RuntimeError("storage")]
-    assert env.invoke([record(1), record(2)]) == failures("1")
-    assert len(env.bodies()) == 1
-
-
-def test_existing_archive_allows_retry_but_conflict_does_not(env):
-    env.s3.effects = [client_error(412, "PreconditionFailed"), client_error(409, "ConditionalRequestConflict")]
-    assert env.invoke([record(1)]) == failures()
-    assert env.invoke([record(2)]) == failures("2")
-    assert len(env.bodies()) == 1
-
-
-def test_archive_key_is_stable_on_sqs_retry(env):
-    env.sqs.effects = [RuntimeError("network"), {"Successful": [{"Id": "0"}]}]
-    assert env.invoke([record(1)]) == failures("1")
-    assert env.invoke([record(1)]) == failures()
-    assert env.s3.requests[0]["Key"] == env.s3.requests[-1]["Key"]
-
-
-def test_logs_do_not_expose_payload_or_sdk_exception_messages(env, capsys):
-    env.s3.effects = [RuntimeError("secret-sdk-message")]
-    assert env.invoke([record(1, message(vehicleId="private-car-id"))]) == failures("1")
+def test_logs_and_exception_do_not_expose_payload_or_sdk_messages(env, capsys):
+    env.firehose.effects = [RuntimeError("secret-sdk-message")]
+    with pytest.raises(RecordFailed) as caught:
+        env.invoke(message(vehicleId="private-car-id"))
     output = capsys.readouterr().out
     assert "private-car-id" not in output
     assert "secret-sdk-message" not in output
+    assert "secret-sdk-message" not in str(caught.value)
+    assert caught.value.__suppress_context__
