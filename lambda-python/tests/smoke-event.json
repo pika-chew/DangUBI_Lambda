@@ -1,15 +1,11 @@
 {
-  "Records": [
-    {
-      "eventSource": "aws:kinesis",
-      "eventSourceARN": "arn:aws:kinesis:ap-northeast-2:000000000000:stream/jenkins-smoke",
-      "eventID": "shardId-000000000000:0",
-      "kinesis": {
-        "sequenceNumber": "0",
-        "partitionKey": "jenkins-smoke",
-        "approximateArrivalTimestamp": 0,
-        "data": "eyJ2ZWhpY2xlSWQiOiJqZW5raW5zLXNtb2tlIiwidHMiOjAsInR5IjowLCJwbGQiOnt9fQ=="
-      }
-    }
-  ]
+  "vehicleId": "jenkins-smoke",
+  "ts": 0,
+  "ty": 4,
+  "pld": {
+    "tid": 0,
+    "clt": 0,
+    "sp": 0,
+    "em": "jenkins-smoke"
+  }
 }
